@@ -32,10 +32,16 @@ Update the system and reboot first, so the running kernel matches the headers th
 | Debian / Ubuntu / Mint | `sudo apt update && sudo apt full-upgrade -y && sudo reboot` |
 | Arch / Manjaro / EndeavourOS | `sudo pacman -Syu && sudo reboot` |
 
-Then run:
+Then install with one command:
 
 ```bash
-bash rtw89-install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/fatih-gh/rtl8852be-vs-fix/main/rtw89-install.sh)
+```
+
+Or clone the repository and run the script:
+
+```bash
+git clone https://github.com/fatih-gh/rtl8852be-vs-fix && cd rtl8852be-vs-fix && bash rtw89-install.sh
 ```
 
 To answer the prompts in advance:
