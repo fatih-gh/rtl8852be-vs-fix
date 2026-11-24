@@ -5,6 +5,23 @@ LOG=~/rtw89-install.log
 exec > >(tee "$LOG") 2>&1
 say() { echo; echo "===== $* ====="; }
 die() { echo; echo "!!!!! FAILED: $* !!!!!"; echo "Log: $LOG"; exit 1; }
+flush_input() { [ -t 0 ] && while read -r -t 0.05 -n 1000 _; do :; done; return 0; }
+tz_to_cc() {
+  local tz="$1" zd=/usr/share/zoneinfo cc="" t c z
+  [ -z "$tz" ] && return
+  cc=$(awk -v tz="$tz" '$3==tz {print $1; exit}' "$zd/zone.tab" 2>/dev/null)
+  if [ -z "$cc" ] && [ -f "$zd/tzdata.zi" ]; then
+    t=$(awk -v tz="$tz" '$1=="L" && $3==tz {print $2; exit}' "$zd/tzdata.zi")
+    [ -n "$t" ] && cc=$(awk -v tz="$t" '$3==tz {print $1; exit}' "$zd/zone.tab" 2>/dev/null)
+  fi
+  if [ -z "$cc" ] && [ -f "$zd/$tz" ]; then
+    while read -r c _ z _; do
+      case "$c" in \#*|"") continue ;; esac
+      cmp -s "$zd/$z" "$zd/$tz" && { cc=$c; break; }
+    done < "$zd/zone.tab"
+  fi
+  echo "$cc"
+}
 [ "$EUID" -eq 0 ] && die "run as your normal user, not with sudo"
 KVER=$(uname -r)
 MODE=install
@@ -32,6 +49,7 @@ if [ -z "$DISTRO" ]; then
   echo "  2) Debian / Ubuntu / Linux Mint"
   echo "  3) Arch Linux / Manjaro / EndeavourOS"
   if [ -t 0 ]; then
+    flush_input
     read -r -p "Select your distribution [${GUESS:-none}]: " ANS
     ANS=${ANS:-$GUESS}
   else
@@ -178,11 +196,17 @@ sudo dkms status rtw89
 say "Wi-Fi region (country code)"
 if [ -z "$COUNTRY" ]; then
   TZNAME=$(timedatectl show -p Timezone --value 2>/dev/null)
-  COUNTRY=$(awk -v tz="$TZNAME" '$3==tz {print $1; exit}' /usr/share/zoneinfo/zone.tab 2>/dev/null)
+  [ -z "$TZNAME" ] && TZNAME=$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')
+  COUNTRY=$(tz_to_cc "$TZNAME")
   echo "Timezone '$TZNAME' -> detected country '${COUNTRY:-unknown}'"
   if [ -t 0 ]; then
-    read -r -p "Country code to use [${COUNTRY:-00}] (2 letters, e.g. TR, DE, US; 00 = world): " ANS
-    [ -n "$ANS" ] && COUNTRY="$ANS"
+    for _try in 1 2 3; do
+      flush_input
+      read -r -p "Country code to use [${COUNTRY:-00}] (2 letters, e.g. TR, DE, US; 00 = world): " ANS
+      ANS=$(echo "${ANS:-${COUNTRY:-00}}" | tr '[:lower:]' '[:upper:]')
+      if echo "$ANS" | grep -qE '^([A-Z]{2}|00)$'; then COUNTRY=$ANS; break; fi
+      echo "Invalid code '$ANS' - enter 2 letters like TR, or 00"
+    done
   fi
 fi
 COUNTRY=$(echo "${COUNTRY:-00}" | tr '[:lower:]' '[:upper:]')
@@ -196,6 +220,7 @@ iw reg get 2>/dev/null | head -3
 say "Performance vs battery"
 if [ -z "$PERF" ] && [ -t 0 ]; then
   echo "Disabling Wi-Fi power saving gives steadier speed/latency but uses more battery."
+  flush_input
   read -r -p "Disable Wi-Fi power saving? [y/N]: " PERF
 fi
 case "$PERF" in
@@ -271,5 +296,9 @@ say "Done"
 echo "Reboot now:  sudo reboot"
 echo "After reboot check:"
 echo "  lsmod | grep rtw89_8852be_git        (should be listed)"
-echo "  nmcli dev wifi list --rescan yes     (5 GHz networks should appear)"
+if command -v nmcli >/dev/null; then
+  echo "  nmcli dev wifi list --rescan yes     (5 GHz networks should appear)"
+else
+  echo "  sudo iw dev \$(iw dev | awk '/Interface/{print \$2; exit}') scan | grep -E 'freq: 5'   (5 GHz networks should appear)"
+fi
 echo "Log: $LOG"
