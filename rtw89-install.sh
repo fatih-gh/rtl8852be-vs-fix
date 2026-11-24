@@ -7,6 +7,16 @@ say() { echo; echo "===== $* ====="; }
 die() { echo; echo "!!!!! FAILED: $* !!!!!"; echo "Log: $LOG"; exit 1; }
 [ "$EUID" -eq 0 ] && die "run as your normal user, not with sudo"
 KVER=$(uname -r)
+MODE=install
+case "$1" in
+  ""|--install) MODE=install ;;
+  --uninstall|-u|uninstall) MODE=uninstall ;;
+  -h|--help)
+    echo "Usage: bash rtw89-install.sh [--install | --uninstall]"
+    echo "Env: DISTRO=fedora|debian|arch  COUNTRY=XX  PERF=y|n"
+    exit 0 ;;
+  *) die "unknown option '$1' (use --install or --uninstall)" ;;
+esac
 
 say "Distribution"
 if [ -z "$DISTRO" ]; then
@@ -38,6 +48,67 @@ case "$DISTRO" in
   fedora|debian|arch) echo "Using: $DISTRO" ;;
   *) die "DISTRO must be fedora, debian or arch" ;;
 esac
+
+if [ "$MODE" = uninstall ]; then
+  say "Uninstall 1/5: removing DKMS driver"
+  if command -v dkms >/dev/null && sudo dkms status rtw89 2>/dev/null | grep -q rtw89; then
+    for v in $(sudo dkms status rtw89 | sed -n 's#^rtw89/\([^,: ]*\).*#\1#p' | sort -u); do
+      sudo dkms remove "rtw89/$v" --all || true
+      sudo rm -rf "/usr/src/rtw89-$v"
+    done
+  else
+    echo "No DKMS rtw89 found."
+  fi
+  sudo rm -rf /lib/modules/*/extra/rtw89 /lib/modules/*/updates/dkms/rtw89_*_git.ko*
+  sudo depmod -a
+
+  say "Uninstall 2/5: removing config files"
+  sudo rm -fv /etc/modprobe.d/rtw89.conf /etc/modprobe.d/rtw89-perf.conf /etc/modprobe.d/regdom.conf \
+    /etc/NetworkManager/conf.d/wifi-powersave-off.conf
+
+  say "Uninstall 3/5: removing fallback service"
+  sudo systemctl disable rtw89-fallback.service 2>/dev/null || true
+  sudo rm -fv /etc/systemd/system/rtw89-fallback.service /usr/local/sbin/rtw89-fallback
+  sudo systemctl daemon-reload
+
+  say "Uninstall 4/5: restoring distribution firmware"
+  FWPKGS=""
+  for f in /lib/firmware/rtw89/*; do
+    [ -e "$f" ] || continue
+    case "$DISTRO" in
+      fedora) p=$(rpm -qf --qf '%{NAME}\n' "$f" 2>/dev/null | grep -v 'not owned') ;;
+      debian) p=$(dpkg -S "$f" 2>/dev/null | cut -d: -f1) ;;
+      arch)   p=$(pacman -Qoq "$f" 2>/dev/null) ;;
+    esac
+    [ -n "$p" ] && FWPKGS="$FWPKGS $p"
+  done
+  FWPKGS=$(echo $FWPKGS | tr ' ' '\n' | sort -u | tr '\n' ' ')
+  if [ -n "${FWPKGS// }" ]; then
+    echo "Reinstalling: $FWPKGS"
+    case "$DISTRO" in
+      fedora) sudo dnf reinstall -y $FWPKGS ;;
+      debian) sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall $FWPKGS ;;
+      arch)   sudo pacman -S --noconfirm $FWPKGS ;;
+    esac || echo "WARNING: firmware reinstall failed - reinstall your linux-firmware package manually"
+  else
+    echo "No packaged rtw89 firmware found - nothing to restore."
+  fi
+
+  say "Uninstall 5/5: switching back to the in-kernel driver"
+  for m in rtw89_8852be_git rtw89_8852b_git rtw89_8852b_common_git rtw89_pci_git rtw89_core_git; do
+    sudo modprobe -r "$m" 2>/dev/null
+  done
+  sudo modprobe rtw89_8852be 2>/dev/null && echo "In-kernel rtw89_8852be loaded." || echo "Reboot to load the in-kernel driver."
+  rm -rf "$SRC"
+
+  say "Uninstalled"
+  if mokutil --sb-state 2>/dev/null | grep -qi enabled; then
+    echo "The DKMS signing key stays enrolled (harmless). To remove it: sudo mokutil --delete /var/lib/dkms/mok.pub"
+  fi
+  echo "Reboot recommended:  sudo reboot"
+  echo "Log: $LOG"
+  exit 0
+fi
 
 say "1/7 System check (kernel $KVER)"
 lspci -nn 2>/dev/null | grep -i b85b || echo "WARNING: 10ec:b85b not found - continuing anyway"

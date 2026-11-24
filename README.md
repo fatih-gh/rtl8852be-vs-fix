@@ -67,18 +67,12 @@ nmcli dev wifi list --rescan yes
 ## Uninstall
 
 ```bash
-sudo dkms remove rtw89/6.15 --all
+bash <(curl -fsSL https://raw.githubusercontent.com/fatih-gh/rtl8852be-vs-fix/main/rtw89-install.sh) --uninstall
 ```
 
-```bash
-sudo rm -f /etc/modprobe.d/rtw89.conf /etc/modprobe.d/rtw89-perf.conf /etc/modprobe.d/regdom.conf /etc/NetworkManager/conf.d/wifi-powersave-off.conf
-```
+Or from a clone: `bash rtw89-install.sh --uninstall`
 
-```bash
-sudo systemctl disable --now rtw89-fallback.service && sudo rm -f /etc/systemd/system/rtw89-fallback.service /usr/local/sbin/rtw89-fallback
-```
-
-Run `sudo dkms status` first if the version shown isn't `6.15`.
+This removes the DKMS driver and config files, disables the fallback service, reinstalls your distribution's firmware package, and switches back to the in-kernel driver. Reboot afterwards.
 
 ## License
 
