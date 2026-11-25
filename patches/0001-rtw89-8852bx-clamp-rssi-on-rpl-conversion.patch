@@ -1,0 +1,19 @@
+diff --git a/rtw8852b_common.c b/rtw8852b_common.c
+index ae9bdf9..efff898 100644
+--- a/rtw8852b_common.c
++++ b/rtw8852b_common.c
+@@ -1992,12 +1992,12 @@ static void __rtw8852bx_query_ppdu(struct rtw89_dev *rtwdev,
+ static void __rtw8852bx_convert_rpl_to_rssi(struct rtw89_dev *rtwdev,
+ 					    struct rtw89_rx_phy_ppdu *phy_ppdu)
+ {
+-	u8 delta = phy_ppdu->rpl_avg - phy_ppdu->rssi_avg;
++	int delta = (int)phy_ppdu->rpl_avg - (int)phy_ppdu->rssi_avg;
+ 	u8 *rssi = phy_ppdu->rssi;
+ 	u8 i;
+ 
+ 	for (i = 0; i < RF_PATH_NUM_8852BX; i++)
+-		rssi[i] += delta;
++		rssi[i] = clamp_t(int, rssi[i] + delta, 0, U8_MAX);
+ 
+ 	phy_ppdu->rssi_avg = phy_ppdu->rpl_avg;
+ }

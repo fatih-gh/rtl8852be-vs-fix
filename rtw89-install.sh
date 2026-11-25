@@ -22,6 +22,101 @@ tz_to_cc() {
   fi
   echo "$cc"
 }
+remove_power_policy() {
+  sudo systemctl disable --now wifi-power-watch.service wifi-power-policy.service 2>/dev/null || true
+  sudo rm -f /usr/local/sbin/wifi-power-policy /usr/local/sbin/wifi-power-watch \
+    /etc/NetworkManager/dispatcher.d/90-wifi-power-policy /etc/udev/rules.d/90-wifi-power-policy.rules \
+    /etc/systemd/system/wifi-power-policy.service /etc/systemd/system/wifi-power-watch.service
+  sudo udevadm control --reload 2>/dev/null || true
+}
+install_power_policy() {
+  sudo mkdir -p /usr/local/sbin /etc/udev/rules.d
+  sudo tee /usr/local/sbin/wifi-power-policy >/dev/null <<'EOF'
+#!/bin/sh
+AC=0
+for s in /sys/class/power_supply/*; do
+  [ "$(cat "$s/type" 2>/dev/null)" = Mains ] && [ "$(cat "$s/online" 2>/dev/null)" = 1 ] && AC=1
+done
+PROFILE=$(powerprofilesctl get 2>/dev/null)
+case "$PROFILE" in
+  power-saver) PS=on ;;
+  performance) PS=off ;;
+  *) [ "$AC" = 1 ] && PS=off || PS=on ;;
+esac
+for i in $(iw dev | awk '/Interface/{print $2}'); do iw dev "$i" set power_save "$PS"; done
+logger -t wifi-power-policy "ac=$AC profile=${PROFILE:-none} -> power_save $PS"
+EOF
+  sudo tee /usr/local/sbin/wifi-power-watch >/dev/null <<'EOF'
+#!/bin/sh
+dbus-monitor --system \
+  "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/freedesktop/UPower/PowerProfiles'" \
+  "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/net/hadess/PowerProfiles'" 2>/dev/null |
+while read -r line; do
+  case "$line" in *ActiveProfile*) /usr/local/sbin/wifi-power-policy ;; esac
+done
+EOF
+  sudo chmod 755 /usr/local/sbin/wifi-power-policy /usr/local/sbin/wifi-power-watch
+  echo 'SUBSYSTEM=="power_supply", ACTION=="change", RUN+="/usr/bin/systemctl --no-block start wifi-power-policy.service"' \
+    | sudo tee /etc/udev/rules.d/90-wifi-power-policy.rules >/dev/null
+  sudo tee /etc/systemd/system/wifi-power-policy.service >/dev/null <<'EOF'
+[Unit]
+Description=Set Wi-Fi power saving from AC state and power profile
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-power-policy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo tee /etc/systemd/system/wifi-power-watch.service >/dev/null <<'EOF'
+[Unit]
+Description=Re-apply Wi-Fi power policy when the power profile changes
+After=dbus.service power-profiles-daemon.service
+
+[Service]
+ExecStart=/usr/local/sbin/wifi-power-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if [ -d /etc/NetworkManager ]; then
+    sudo mkdir -p /etc/NetworkManager/dispatcher.d
+    sudo tee /etc/NetworkManager/dispatcher.d/90-wifi-power-policy >/dev/null <<'EOF'
+#!/bin/sh
+[ "$2" = up ] && /usr/local/sbin/wifi-power-policy
+exit 0
+EOF
+    sudo chmod 755 /etc/NetworkManager/dispatcher.d/90-wifi-power-policy
+    sudo systemctl enable NetworkManager-dispatcher.service 2>/dev/null || true
+  fi
+  sudo udevadm control --reload 2>/dev/null || true
+  sudo systemctl daemon-reload
+  sudo systemctl enable wifi-power-policy.service
+  if command -v dbus-monitor >/dev/null; then
+    sudo systemctl enable --now wifi-power-watch.service
+  else
+    echo "NOTE: dbus-monitor not found - power profile changes won't be followed (charger and reconnect still are)."
+  fi
+  command -v powerprofilesctl >/dev/null || echo "NOTE: power-profiles-daemon not found - policy follows the charger only."
+  sudo /usr/local/sbin/wifi-power-policy
+}
+apply_rssi_fix() {
+  local f=rtw8852b_common.c
+  grep -q 'clamp_t(int, rssi\[i\] + delta' "$f" && { echo "RSSI fix already present."; return 0; }
+  sed -i -e 's/u8 delta = phy_ppdu->rpl_avg - phy_ppdu->rssi_avg;/int delta = (int)phy_ppdu->rpl_avg - (int)phy_ppdu->rssi_avg;/' \
+    -e 's/rssi\[i\] += delta;/rssi[i] = clamp_t(int, rssi[i] + delta, 0, U8_MAX);/' "$f"
+  if [ "$(grep -c -e 'int delta = (int)phy_ppdu->rpl_avg' -e 'clamp_t(int, rssi\[i\] + delta' "$f")" = 2 ]; then
+    echo "RSSI fix applied."
+    return 0
+  fi
+  echo "WARNING: RSSI fix did not apply cleanly - continuing without it."
+  git checkout -f -q -- "$f"
+  return 1
+}
 [ "$EUID" -eq 0 ] && die "run as your normal user, not with sudo"
 KVER=$(uname -r)
 MODE=install
@@ -30,7 +125,7 @@ case "$1" in
   --uninstall|-u|uninstall) MODE=uninstall ;;
   -h|--help)
     echo "Usage: bash rtw89-install.sh [--install | --uninstall]"
-    echo "Env: DISTRO=fedora|debian|arch  COUNTRY=XX  PERF=y|n"
+    echo "Env: DISTRO=fedora|debian|arch  COUNTRY=XX  PERF=auto|off|on  RSSI_FIX=y|n"
     exit 0 ;;
   *) die "unknown option '$1' (use --install or --uninstall)" ;;
 esac
@@ -84,8 +179,9 @@ if [ "$MODE" = uninstall ]; then
   sudo rm -fv /etc/modprobe.d/rtw89.conf /etc/modprobe.d/rtw89-perf.conf /etc/modprobe.d/regdom.conf \
     /etc/NetworkManager/conf.d/wifi-powersave-off.conf
 
-  say "Uninstall 3/5: removing fallback service"
-  sudo systemctl disable rtw89-fallback.service 2>/dev/null || true
+  say "Uninstall 3/5: removing fallback service and power policy"
+  sudo systemctl disable --now rtw89-fallback.service wifi-power-watch.service wifi-power-policy.service 2>/dev/null || true
+  remove_power_policy
   sudo rm -fv /etc/systemd/system/rtw89-fallback.service /usr/local/sbin/rtw89-fallback
   sudo systemctl daemon-reload
 
@@ -136,6 +232,7 @@ say "2/7 Installing build tools + headers ($DISTRO)"
 case "$DISTRO" in
   fedora)
     sudo dnf install -y git make gcc dkms mokutil elfutils-libelf-devel kernel-devel iw wireless-regdb || die "dnf failed"
+    sudo dnf install -y dbus-tools >/dev/null 2>&1 || true
     if [ ! -e "/lib/modules/$KVER/build/Makefile" ]; then
       sudo dnf install -y "kernel-devel-$KVER" || {
         V=${KVER%%-*}; R=${KVER#*-}; R=${R%.x86_64}
@@ -148,6 +245,7 @@ case "$DISTRO" in
     sudo apt-get update || die "apt-get update failed"
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential dkms mokutil libelf-dev iw wireless-regdb \
       || die "apt-get install failed"
+    command -v dbus-monitor >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dbus-bin >/dev/null 2>&1 || true
     if [ ! -e "/lib/modules/$KVER/build/Makefile" ]; then
       sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$KVER" \
         || die "no linux-headers-$KVER - run 'sudo apt full-upgrade', reboot, and rerun"
@@ -170,6 +268,11 @@ cd "$SRC" || die "cannot enter $SRC"
 git fetch origin >/dev/null 2>&1
 git checkout -f -q "$COMMIT" || die "commit $COMMIT not found"
 git log -1 --oneline
+PATCHED=n
+case "${RSSI_FIX:-y}" in
+  n|N|no|NO) echo "RSSI fix skipped (RSSI_FIX=n)." ;;
+  *) apply_rssi_fix && PATCHED=y ;;
+esac
 PKGVER=$(sed -n 's/^PACKAGE_VERSION="\?\([^"]*\)"\?/\1/p' dkms.conf | head -1)
 [ -z "$PKGVER" ] && die "could not read PACKAGE_VERSION from dkms.conf"
 echo "DKMS package: rtw89/$PKGVER"
@@ -184,7 +287,16 @@ if sudo dkms status rtw89 2>/dev/null | grep -q rtw89; then
 fi
 
 say "5/7 Building + installing with DKMS"
-sudo dkms install "$PWD" || die "dkms install failed - see /var/lib/dkms/rtw89/$PKGVER/build/make.log"
+if ! sudo dkms install "$PWD"; then
+  [ "$PATCHED" = y ] || die "dkms install failed - see /var/lib/dkms/rtw89/$PKGVER/build/make.log"
+  echo "WARNING: build with RSSI fix failed - retrying without it"
+  sudo dkms remove "rtw89/$PKGVER" --all 2>/dev/null || true
+  sudo rm -rf "/usr/src/rtw89-$PKGVER"
+  git checkout -f -q -- rtw8852b_common.c
+  PATCHED=n
+  sudo dkms install "$PWD" || die "dkms install failed - see /var/lib/dkms/rtw89/$PKGVER/build/make.log"
+fi
+echo "RSSI fix in build: $PATCHED"
 for d in /lib/modules/*; do
   k=$(basename "$d"); [ "$k" = "$KVER" ] && continue
   [ -e "$d/build/Makefile" ] && sudo dkms install "rtw89/$PKGVER" -k "$k" || true
@@ -217,29 +329,35 @@ echo "options cfg80211 ieee80211_regdom=$COUNTRY" | sudo tee /etc/modprobe.d/reg
 sudo iw reg set "$COUNTRY" 2>/dev/null || true
 iw reg get 2>/dev/null | head -3
 
-say "Performance vs battery"
+say "Wi-Fi power saving"
 if [ -z "$PERF" ] && [ -t 0 ]; then
-  echo "Disabling Wi-Fi power saving gives steadier speed/latency but uses more battery."
+  echo "  a) auto - off on charger or Performance profile, on for battery or Power Saver (recommended)"
+  echo "  o) off  - always off: fastest and steadiest, uses more battery"
+  echo "  n) on   - always on: saves battery, slower on this card"
   flush_input
-  read -r -p "Disable Wi-Fi power saving? [y/N]: " PERF
+  read -r -p "Wi-Fi power saving [a/o/n] (default a): " PERF
 fi
-case "$PERF" in
-  y|Y|yes|YES)
-    sudo tee /etc/modprobe.d/rtw89-perf.conf >/dev/null <<'EOF'
-options rtw89_core_git disable_ps_mode=y
-options rtw89_pci_git disable_aspm_l1=y disable_aspm_l1ss=y
-options rtw89_core disable_ps_mode=y
-options rtw89_pci disable_aspm_l1=y disable_aspm_l1ss=y
-EOF
+sudo rm -f /etc/modprobe.d/rtw89-perf.conf
+case "${PERF:-auto}" in
+  o|O|off|OFF|y|Y|yes|YES)
+    remove_power_policy
     if [ -d /etc/NetworkManager ]; then
       sudo mkdir -p /etc/NetworkManager/conf.d
       printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/wifi-powersave-off.conf >/dev/null
+      echo "Power saving: always OFF (undo: rerun with PERF=auto)"
+    else
+      echo "NOTE: NetworkManager not found - set power saving with 'iw dev <if> set power_save off'."
     fi
-    echo "Performance mode ON (undo: sudo rm -f /etc/modprobe.d/rtw89-perf.conf /etc/NetworkManager/conf.d/wifi-powersave-off.conf)"
+    ;;
+  n|N|on|ON|no|NO)
+    remove_power_policy
+    sudo rm -f /etc/NetworkManager/conf.d/wifi-powersave-off.conf
+    echo "Power saving: always ON (battery mode)"
     ;;
   *)
-    sudo rm -f /etc/modprobe.d/rtw89-perf.conf /etc/NetworkManager/conf.d/wifi-powersave-off.conf
-    echo "Battery mode (power saving stays on). Rerun with PERF=y if speed is unstable."
+    sudo rm -f /etc/NetworkManager/conf.d/wifi-powersave-off.conf
+    install_power_policy
+    echo "Power saving: AUTO (check: journalctl -t wifi-power-policy -n 5)"
     ;;
 esac
 
