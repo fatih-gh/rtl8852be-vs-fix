@@ -1,0 +1,24 @@
+Subject: [PATCH] wifi: rtw89: add ra_init_lv module parameter
+
+Allow forcing the initial RA rate level once the RSSI is known, for testing
+rate adaptation that stays at a low start level.
+---
+--- a/phy.c	2026-11-25 11:52:29.290015620 +0000
++++ b/phy.c	2026-11-25 11:52:29.292304536 +0000
+@@ -510,10 +510,16 @@
+ 	ra->csi_mode = csi_mode;
+ }
+ 
++static uint rtw89_ra_init_lv;
++module_param_named(ra_init_lv, rtw89_ra_init_lv, uint, 0644);
++MODULE_PARM_DESC(ra_init_lv, "Initial RA rate level once RSSI is known (0=by RSSI, 1=high, 2=mid, 3=low)");
++
+ static u8 rtw89_phy_ra_get_init_rate_lv(struct rtw89_sta_link *rtwsta_link)
+ {
+ 	u8 rssi = ewma_rssi_read(&rtwsta_link->avg_rssi) >> RSSI_FACTOR;
+ 
++	if (rssi > 1 && rtw89_ra_init_lv >= 1 && rtw89_ra_init_lv <= 3)
++		return rtw89_ra_init_lv;
+ 	if (rssi > 40)
+ 		return 1;
+ 	if (rssi > 20)
