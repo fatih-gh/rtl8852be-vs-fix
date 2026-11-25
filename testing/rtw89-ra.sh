@@ -49,8 +49,8 @@ echo "Keep the laptop still, doors as they are, no other network use."
 for r in 1 2 3; do run 0 R$r; run 1 R$r; done
 
 say "3/3 summary"
-awk '{split($1,a,"="); v=a[2]; s[v]+=$9+$10; c[v]+=2} END {for (k in s) printf "lv=%s: avg %.0f Mbit/s\n", k, s[k]/c[k]}' /tmp/ra.res | sort
-BEST=$(awk '{split($1,a,"="); v=a[2]; s[v]+=$9+$10; c[v]+=2} END {for (k in s) printf "%s %.1f\n", k, s[k]/c[k]}' /tmp/ra.res | sort -k2 -nr | head -1 | cut -d' ' -f1)
+awk '{split($1,a,"="); v=a[2]; s[v]+=$10+$11; c[v]+=2} END {for (k in s) printf "lv=%s: avg %.0f Mbit/s\n", k, s[k]/c[k]}' /tmp/ra.res | sort
+BEST=$(awk '{split($1,a,"="); v=a[2]; s[v]+=$10+$11; c[v]+=2} END {for (k in s) printf "%s %.1f\n", k, s[k]/c[k]}' /tmp/ra.res | sort -k2 -nr | head -1 | cut -d' ' -f1)
 echo "options rtw89_core_git ra_init_lv=$BEST" | sudo tee /etc/modprobe.d/rtw89-ra.conf
 echo $BEST | sudo tee $PARAM >/dev/null
 nmcli connection up "$CON" >/dev/null 2>&1
