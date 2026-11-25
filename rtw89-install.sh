@@ -37,10 +37,13 @@ AC=0
 for s in /sys/class/power_supply/*; do
   [ "$(cat "$s/type" 2>/dev/null)" = Mains ] && [ "$(cat "$s/online" 2>/dev/null)" = 1 ] && AC=1
 done
-PROFILE=$(powerprofilesctl get 2>/dev/null)
+PROFILE=$(busctl get-property org.freedesktop.UPower.PowerProfiles /org/freedesktop/UPower/PowerProfiles org.freedesktop.UPower.PowerProfiles ActiveProfile 2>/dev/null | cut -d'"' -f2)
+[ -z "$PROFILE" ] && PROFILE=$(busctl get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile 2>/dev/null | cut -d'"' -f2)
+[ -z "$PROFILE" ] && PROFILE=$(powerprofilesctl get 2>/dev/null)
+[ -z "$PROFILE" ] && PROFILE=$(tuned-adm active 2>/dev/null | sed -n 's/^Current active profile: //p')
 case "$PROFILE" in
-  power-saver) PS=on ;;
-  performance) PS=off ;;
+  power-saver|*powersave*) PS=on ;;
+  performance|*performance*) PS=off ;;
   *) [ "$AC" = 1 ] && PS=off || PS=on ;;
 esac
 for i in $(iw dev | awk '/Interface/{print $2}'); do iw dev "$i" set power_save "$PS"; done
@@ -101,7 +104,8 @@ EOF
   else
     echo "NOTE: dbus-monitor not found - power profile changes won't be followed (charger and reconnect still are)."
   fi
-  command -v powerprofilesctl >/dev/null || echo "NOTE: power-profiles-daemon not found - policy follows the charger only."
+  PP=$(sudo /usr/local/sbin/wifi-power-policy >/dev/null 2>&1; journalctl -t wifi-power-policy -n 1 -o cat 2>/dev/null)
+  case "$PP" in *profile=none*) echo "NOTE: no power profile service found (power-profiles-daemon or tuned) - policy follows the charger only." ;; esac
   sudo /usr/local/sbin/wifi-power-policy
 }
 apply_rssi_fix() {
