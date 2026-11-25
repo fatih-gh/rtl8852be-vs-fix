@@ -9,7 +9,9 @@ FW19_SHA=0b8b054e2e4ac0a5643bb13ad4618d0f1f369a02720602afb9ff0c8ec987aaba
 CON=${CON:-MERCUSYS_4F24}
 W=~/rtw89-tune
 F=/lib/firmware/rtw89/rtw8852b_fw-2.bin
-NAMES="OFFICIAL HYB HYB_TRK HYB_PWR"
+NAMES=${NAMES:-"OFFICIAL HYB HYB_TRK HYB_PWR"}
+PASSES=${PASSES:-2}
+SKIPBAND=${SKIPBAND:-0}
 declare -A TAKE=([OFFICIAL]="" [HYB]="2,3,4,5,8" [HYB_TRK]="2,3,4,5,8,18" [HYB_PWR]="2,3,4,5,8,9,10,11,13,14,16,17")
 say() { echo; echo "===== $* ====="; }
 fail() { echo "!!!!! $* !!!!!"; exit 1; }
@@ -90,22 +92,41 @@ speed() {
   t=$(awk '{s+=$1} END {printf "%.0f", s*8/1e6}' $W/par.$$); rm -f $W/par.$$
   echo "$t 0"
 }
+rxrate() {
+  local r1 r2
+  r1=$(cat /sys/class/net/$IF/statistics/rx_bytes); sleep 3; r2=$(cat /sys/class/net/$IF/statistics/rx_bytes)
+  echo $(( (r2 - r1) * 8 / 3 / 1000000 ))
+}
+quiet() {
+  local i bg
+  for i in $(seq 20); do
+    bg=$(rxrate)
+    [ "$bg" -lt 2 ] && return 0
+    echo "   other traffic detected (${bg} Mbit/s) - close fast.com/downloads, waiting..."
+    sleep 7
+  done
+  echo "   WARNING: background traffic did not stop - this result may be low"
+}
 run() {
   local n=$1 band=$2 tag=$3
   usefw $n $band
   if ! online; then echo "$tag $n OFFLINE" | tee -a $W/res; return; fi
   timeout 20 curl -s -o /dev/null --max-time 15 https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso
   local a b
-  a=$(speed); b=$(speed)
+  quiet; a=$(speed)
+  quiet; b=$(speed)
   printf "%s %s %s %s %s %s\n" "$tag" "$n" $a $b | tee -a $W/res
 }
 
 say "3/5 measuring firmware variants on 5 GHz (mirrored order, power save off)"
+echo "Do not use the network during this test (no fast.com, downloads, streaming)."
 : > $W/res
 FWD=""; for n in $NAMES; do FWD="$FWD $n"; done
 REV=$(echo $FWD | tr ' ' '\n' | tac | tr '\n' ' ')
-for n in $FWD; do run $n a P1; done
-for n in $REV; do run $n a P2; done
+for p in $(seq $PASSES); do
+  if [ $((p % 2)) = 1 ]; then ORDER=$FWD; else ORDER=$REV; fi
+  for n in $ORDER; do run $n a P$p; done
+done
 
 say "4/5 choosing the fastest firmware"
 BEST=$(awk '$3!="OFFLINE" {s[$2]+=$3+$5; c[$2]+=2} $3=="OFFLINE" {bad[$2]=1} END {for (n in s) if (!bad[n]) printf "%s %.1f\n", n, s[n]/c[n]}' $W/res | sort -k2 -nr | tee $W/rank | head -1 | awk '{print $1}')
@@ -114,12 +135,15 @@ echo "ranking (avg Mbit/s):"; cat $W/rank
 echo ">>> fastest firmware: $BEST"
 BEST5=$(awk -v b=$BEST '$1==b {print $2}' $W/rank)
 
-say "5/5 band check with $BEST (5 GHz vs 2.4 GHz)"
-run $BEST bg B24
-run $BEST bg B24
-B24=$(awk -v b=$BEST '$1=="B24" && $2==b && $3!="OFFLINE" {s+=$3+$5; c+=2} END {printf "%.1f", c? s/c : 0}' $W/res)
-echo "5 GHz avg: ${BEST5:-0}  2.4 GHz avg: $B24"
-if awk -v a=${BEST5:-0} -v g=$B24 'BEGIN{exit !(g > a*1.15)}'; then BAND=bg; else BAND=a; fi
+BAND=a
+if [ "$SKIPBAND" != 1 ]; then
+  say "5/5 band check with $BEST (5 GHz vs 2.4 GHz)"
+  run $BEST bg B24
+  run $BEST bg B24
+  B24=$(awk -v b=$BEST '$1=="B24" && $2==b && $3!="OFFLINE" {s+=$3+$5; c+=2} END {printf "%.1f", c? s/c : 0}' $W/res)
+  echo "5 GHz avg: ${BEST5:-0}  2.4 GHz avg: $B24"
+  if awk -v a=${BEST5:-0} -v g=$B24 'BEGIN{exit !(g > a*1.15)}'; then BAND=bg; fi
+fi
 echo ">>> installing $BEST with band $([ $BAND = a ] && echo 5GHz || echo 2.4GHz)"
 usefw $BEST $BAND
 online || { nmcli connection modify "$CON" 802-11-wireless.band ""; nmcli connection up "$CON" >/dev/null 2>&1; echo "offline - switched to auto band"; }
