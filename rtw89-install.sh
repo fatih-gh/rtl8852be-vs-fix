@@ -117,6 +117,38 @@ apply_rssi_fix() {
   git checkout -f -q -- "$f"
   return 1
 }
+UP_RAW=https://raw.githubusercontent.com/fatih-gh/rtl8852be-vs-fix/main/patches/upstream
+UP_PATCHES="164c4ebdb1c93775960f4b310aa744d4d10dc208a678291593bc0649c744e0a6 0001-wifi-rtw89-avoid-premature-power-save-entry-for-buff.patch
+be1f23ecd4b46137f1fb94033379ab89675521fc3febba1a6b8e6bb97d75631d 0002-wifi-rtw89-enable-low-latency-power-save-optimizatio.patch
+27c06e6a5c74896113d6daf414640bd88a4a2b2a4fd9cdfa991a530300bf2999 0003-wifi-rtw89-set-RA-init-rate-level-when-the-station-R.patch
+dbd7e428b4e6e6aae82e8669708fbd9785dd6845bd573c4fdefd999245333234 0004-wifi-rtw89-coex-set-the-WL-BT-antenna-map-on-shared-.patch
+11475651fc6378c6f312fafc0235348c3e0e20cd27b0e56f39d6decfe94b9a0a 0006-wifi-rtw89-8852b-update-default-value-for-ANA-SWR.patch"
+fetch_upstream() {
+  local sha p
+  UPDIR=$(mktemp -d)
+  while read -r sha p; do
+    curl -fsSL "$UP_RAW/$p" -o "$UPDIR/$p" || { echo "WARNING: download of $p failed"; return 1; }
+    echo "$sha  $UPDIR/$p" | sha256sum -c --quiet - || { echo "WARNING: checksum mismatch for $p"; return 1; }
+  done <<< "$UP_PATCHES"
+}
+apply_upstream() {
+  local sha p
+  while read -r sha p; do
+    if ! patch -s -p1 -F3 --no-backup-if-mismatch < "$UPDIR/$p"; then
+      echo "WARNING: $p did not apply - continuing without upstream patches"
+      return 1
+    fi
+    echo "applied ${p%.patch}"
+  done <<< "$UP_PATCHES"
+}
+prepare_src() {
+  git checkout -f -q "$COMMIT" || die "commit $COMMIT not found"
+  RSSI=n; UPSTREAM_IN=n
+  [ "$1" -ge 1 ] && apply_rssi_fix && RSSI=y
+  if [ "$1" -ge 2 ]; then
+    if apply_upstream; then UPSTREAM_IN=y; else git checkout -f -q "$COMMIT"; [ "$RSSI" = y ] && apply_rssi_fix >/dev/null; fi
+  fi
+}
 [ "$EUID" -eq 0 ] && die "run as your normal user, not with sudo"
 KVER=$(uname -r)
 MODE=install
@@ -125,7 +157,7 @@ case "$1" in
   --uninstall|-u|uninstall) MODE=uninstall ;;
   -h|--help)
     echo "Usage: bash rtw89-install.sh [--install | --uninstall]"
-    echo "Env: DISTRO=fedora|debian|arch  COUNTRY=XX  PERF=auto|off|on  RSSI_FIX=y|n"
+    echo "Env: DISTRO=fedora|debian|arch  COUNTRY=XX  PERF=auto|off|on  RSSI_FIX=y|n  UPSTREAM=y|n"
     exit 0 ;;
   *) die "unknown option '$1' (use --install or --uninstall)" ;;
 esac
@@ -268,11 +300,11 @@ cd "$SRC" || die "cannot enter $SRC"
 git fetch origin >/dev/null 2>&1
 git checkout -f -q "$COMMIT" || die "commit $COMMIT not found"
 git log -1 --oneline
-PATCHED=n
-case "${RSSI_FIX:-y}" in
-  n|N|no|NO) echo "RSSI fix skipped (RSSI_FIX=n)." ;;
-  *) apply_rssi_fix && PATCHED=y ;;
-esac
+LEVEL=2
+case "${RSSI_FIX:-y}" in n|N|no|NO) LEVEL=0; echo "RSSI fix and upstream patches skipped (RSSI_FIX=n)." ;; esac
+case "${UPSTREAM:-y}" in n|N|no|NO) [ $LEVEL = 2 ] && LEVEL=1; echo "Upstream patches skipped (UPSTREAM=n)." ;; esac
+if [ $LEVEL = 2 ] && ! fetch_upstream; then LEVEL=1; fi
+prepare_src $LEVEL
 PKGVER=$(sed -n 's/^PACKAGE_VERSION="\?\([^"]*\)"\?/\1/p' dkms.conf | head -1)
 [ -z "$PKGVER" ] && die "could not read PACKAGE_VERSION from dkms.conf"
 echo "DKMS package: rtw89/$PKGVER"
@@ -287,16 +319,21 @@ if sudo dkms status rtw89 2>/dev/null | grep -q rtw89; then
 fi
 
 say "5/7 Building + installing with DKMS"
-if ! sudo dkms install "$PWD"; then
-  [ "$PATCHED" = y ] || die "dkms install failed - see /var/lib/dkms/rtw89/$PKGVER/build/make.log"
-  echo "WARNING: build with RSSI fix failed - retrying without it"
+while ! sudo dkms install "$PWD"; do
   sudo dkms remove "rtw89/$PKGVER" --all 2>/dev/null || true
   sudo rm -rf "/usr/src/rtw89-$PKGVER"
-  git checkout -f -q -- rtw8852b_common.c
-  PATCHED=n
-  sudo dkms install "$PWD" || die "dkms install failed - see /var/lib/dkms/rtw89/$PKGVER/build/make.log"
-fi
-echo "RSSI fix in build: $PATCHED"
+  if [ "$UPSTREAM_IN" = y ]; then
+    echo "WARNING: build with upstream patches failed - retrying without them"
+    prepare_src 1
+  elif [ "$RSSI" = y ]; then
+    echo "WARNING: build with RSSI fix failed - retrying without it"
+    prepare_src 0
+  else
+    die "dkms install failed - see /var/lib/dkms/rtw89/$PKGVER/build/make.log"
+  fi
+done
+[ -n "$UPDIR" ] && rm -rf "$UPDIR"
+echo "RSSI fix in build: $RSSI   upstream patches in build: $UPSTREAM_IN"
 for d in /lib/modules/*; do
   k=$(basename "$d"); [ "$k" = "$KVER" ] && continue
   [ -e "$d/build/Makefile" ] && sudo dkms install "rtw89/$PKGVER" -k "$k" || true
