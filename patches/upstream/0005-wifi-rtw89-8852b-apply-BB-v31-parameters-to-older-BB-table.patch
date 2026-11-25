@@ -1,0 +1,50 @@
+From: fatih-gh <104904450+fatih-gh@users.noreply.github.com>
+Subject: [PATCH] wifi: rtw89: 8852b: apply BB v31 parameters to older BB tables
+
+BB parameter v28 (firmware 0.29.29.18 and older) lacks five writes that
+v31 and the vendor driver have: 0x2008, 0x12a8/0x32a8 (RF mode RX
+baseband power save) and 0x1210/0x3210 (reset control). Write them after
+the BB table when the loaded table does not contain them.
+---
+--- a/phy.c	2026-11-25 02:11:02.973454373 +0000
++++ b/phy.c	2026-11-25 02:11:02.980021203 +0000
+@@ -1954,6 +1954,31 @@
+ 	}
+ }
+ 
++static void rtw89_phy_8852b_bb_v31_fixup(struct rtw89_dev *rtwdev,
++					  const struct rtw89_phy_table *table)
++{
++	static const struct rtw89_reg2_def regs[] = {
++		{0x2008, 0x08000000},
++		{0x12a8, 0x33337025},
++		{0x32a8, 0x33337025},
++		{0x1210, 0xc0000c06},
++		{0x3210, 0xc0000c06},
++	};
++	u32 i;
++
++	if (rtwdev->chip->chip_id != RTL8852B)
++		return;
++
++	for (i = 0; i < table->n_regs; i++)
++		if (table->regs[i].addr == 0x12a8)
++			return;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		rtw89_phy_write32(rtwdev, regs[i].addr, regs[i].data);
++
++	rtw89_info(rtwdev, "applied BB v31 parameters to older BB table\n");
++}
++
+ void rtw89_phy_init_bb_reg(struct rtw89_dev *rtwdev)
+ {
+ 	struct rtw89_fw_elm_info *elm_info = &rtwdev->fw.elm_info;
+@@ -1969,6 +1994,7 @@
+ 	if (rtwdev->dbcc_en)
+ 		rtw89_phy_init_reg(rtwdev, bb_table, false, rtw89_phy_config_bb_reg,
+ 				   (void *)RTW89_PHY_1);
++	rtw89_phy_8852b_bb_v31_fixup(rtwdev, bb_table);
+ 
+ 	rtw89_io_unpack(rtwdev);
+ 
